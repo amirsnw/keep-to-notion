@@ -12,7 +12,8 @@ Keep-to-Notion is a Rust application designed to convert HTML files into Markdow
 ## Requirements
 
 - Rust and Cargo installed on your system.
-- A Notion account with a database set up for receiving notes.
+- A Notion account with a database set up for receiving notes. 
+- Notion Integration created: https://www.notion.com/my-integrations
 - Environment variables `NOTION_TOKEN` and `NOTION_DATABASE_ID` set up for authentication and database identification.
 
 ## Installation
