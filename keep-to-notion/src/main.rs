@@ -370,6 +370,39 @@ fn _zip_and_cleanup(target_dir: &Path) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+fn check_note_exists_in_notion(title: &str) -> Result<bool> {
+    dotenv().ok();
+    let notion_token = env::var("NOTION_TOKEN")?;
+    let database_id = env::var("NOTION_DATABASE_ID")?;
+    let client = Client::new();
+
+    let json_request = json!({
+        "filter": {
+            "property": "Name",
+            "title": {
+                "equals": title
+            }
+        }
+    });
+
+    let res = client
+        .post(format!("https://api.notion.com/v1/databases/{}/query", database_id))
+        .header("Notion-Version", "2022-06-28")
+        .header(AUTHORIZATION, format!("Bearer {}", notion_token))
+        .header(CONTENT_TYPE, "application/json")
+        .json(&json_request)
+        .send()?;
+
+    if res.status() != 200 {
+        return Err(anyhow::anyhow!("Failed to query Notion database: {}", res.text()?));
+    }
+
+    let response: serde_json::Value = res.json()?;
+    let results = response["results"].as_array().unwrap();
+    
+    Ok(!results.is_empty())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
@@ -390,9 +423,19 @@ fn main() -> Result<()> {
         .progress_chars("#>-"));
 
     let mut index: u64 = 0;
+    let mut skipped_count = 0;
     for html_file in html_files {
         index += 1;
         let title = extract_html_title(&html_file)?;
+        
+        // Check if note already exists in Notion
+        if check_note_exists_in_notion(&title)? {
+            pb.set_message(format!("Skipping existing note: {}", title));
+            skipped_count += 1;
+            pb.inc(1);
+            continue;
+        }
+
         let body = extract_html_body(&html_file)?;
         let tags = extract_html_tags(&html_file)?;
         let mut image_urls = vec![];
@@ -456,6 +499,9 @@ fn main() -> Result<()> {
     // _zip_and_cleanup(output_dir)?;
 
     // Finish progress bar with completion message
-    pb.finish_with_message("✅ All files processed successfully");
+    pb.finish_with_message(format!(
+        "✅ All files processed successfully ({} skipped)",
+        skipped_count
+    ));
     Ok(())
 }
