@@ -5,7 +5,6 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use scraper::{Html, Selector};
 use serde_json::json;
 use std::env;
-use std::fmt::format;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -187,8 +186,6 @@ fn upload_image_to_dropbox(file_path: &Path) -> Result<String, anyhow::Error> {
         .send()?;
 
     if res.status().is_success() {
-        let response = res.text()?;
-        let json: serde_json::Value = serde_json::from_str(&response)?;
         let url = get_or_create_shared_link(&dropbox_path)?;
         println!("Uploaded {} to Dropbox URL: {}", dropbox_path, url);
         Ok(url)
@@ -422,10 +419,8 @@ fn main() -> Result<()> {
         .unwrap()
         .progress_chars("#>-"));
 
-    let mut index: u64 = 0;
     let mut skipped_count = 0;
     for html_file in html_files {
-        index += 1;
         let title = extract_html_title(&html_file)?;
         
         // Check if note already exists in Notion
@@ -477,7 +472,7 @@ fn main() -> Result<()> {
             image_paths: &image_urls,
         };
 
-        // send_note_to_notion(note)?;
+        send_note_to_notion(note)?;
         // _export_to_markdown(note, output_dir, index)?;
 
         println!(
