@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use dotenv::dotenv;
 use indicatif::{ProgressBar, ProgressStyle};
+use lazy_static::lazy_static;
 use oauth2::{
     basic::BasicClient, reqwest::http_client, AuthUrl, ClientId, ClientSecret, CsrfToken,
     RedirectUrl, Scope, TokenResponse, TokenUrl,
@@ -11,20 +12,19 @@ use scraper::{Html, Selector};
 use serde_json::json;
 use std::env;
 use std::fs::File;
-use std::io::{Write};
-use std::io::{BufWriter, BufRead};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use std::{fs, vec};
 use url::Url;
 use walkdir::WalkDir;
 use zip;
-use lazy_static::lazy_static;
-use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone)]
 struct TokenManager {
     token: String,
+    refresh_token: String,
     expires_at: u64,
 }
 
@@ -32,6 +32,7 @@ impl TokenManager {
     fn new() -> Self {
         Self {
             token: String::new(),
+            refresh_token: String::new(),
             expires_at: 0,
         }
     }
@@ -44,12 +45,14 @@ impl TokenManager {
         self.expires_at > current_time && !self.token.is_empty()
     }
 
-    fn set_token(&mut self, token: String, expires_in: u64) {
+    fn set_token(&mut self, token: String, refresh_token: String, expires_in: u64) {
         self.token = token;
+        self.refresh_token = refresh_token;
         self.expires_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_secs() + expires_in;
+            .as_secs()
+            + expires_in;
     }
 }
 
@@ -198,11 +201,43 @@ fn get_dropbox_token() -> Result<String> {
     let token_manager = DROPBOX_TOKEN.lock().unwrap();
     if !token_manager.is_valid() {
         drop(token_manager);
-        create_dropbox_token()?;
+        if !DROPBOX_TOKEN.lock().unwrap().refresh_token.is_empty() {
+            refresh_dropbox_token()?;
+        } else {
+            create_dropbox_token()?;
+        }
         Ok(DROPBOX_TOKEN.lock().unwrap().token.clone())
     } else {
         Ok(token_manager.token.clone())
     }
+}
+
+fn refresh_dropbox_token() -> Result<()> {
+    let client_id = env::var("DROPBOX_KEY")?;
+    let secret = env::var("DROPBOX_SECRET")?;
+    let refresh_token = DROPBOX_TOKEN.lock().unwrap().refresh_token.clone();
+
+    // 1. Setup OAuth2 client
+    let client = BasicClient::new(
+        ClientId::new(client_id),
+        Some(ClientSecret::new(secret)),
+        AuthUrl::new("https://www.dropbox.com/oauth2/authorize".to_string()).unwrap(),
+        Some(TokenUrl::new("https://api.dropboxapi.com/oauth2/token".to_string()).unwrap()),
+    );
+
+    let token_response = client
+        .exchange_refresh_token(&oauth2::RefreshToken::new(refresh_token))
+        .request(http_client)
+        .expect("Failed to refresh token");
+
+    let mut token_manager = DROPBOX_TOKEN.lock().unwrap();
+    token_manager.set_token(
+        token_response.access_token().secret().to_string(),
+        token_response.refresh_token().unwrap().secret().to_string(),
+        token_response.expires_in().map(|d| d.as_secs()).unwrap_or(14400)
+    );
+    println!("DROPBOX_TOKEN: {}", token_manager.token);
+    Ok(())
 }
 
 fn create_dropbox_token() -> Result<()> {
@@ -224,22 +259,23 @@ fn create_dropbox_token() -> Result<()> {
         .add_scope(Scope::new("files.content.write".to_string()))
         .add_scope(Scope::new("files.content.read".to_string()))
         .add_scope(Scope::new("sharing.write".to_string()))
+        .add_extra_param("token_access_type", "offline")
         .url();
 
     // 3. Open the authorization URL in the default browser
     println!("Please open this URL in your browser to authorize the application:");
     println!("{}", auth_url);
-    
+
     // 4. Start a local server to receive the callback
     let listener = std::net::TcpListener::bind("127.0.0.1:8080")?;
     println!("Waiting for authorization...");
-    
+
     // 5. Handle the callback
     let (stream, _) = listener.accept()?;
     let mut stream = std::io::BufReader::new(stream);
     let mut request_line = String::new();
     stream.read_line(&mut request_line)?;
-    
+
     // 6. Extract the authorization code from the request
     let code = request_line
         .split_whitespace()
@@ -260,11 +296,15 @@ fn create_dropbox_token() -> Result<()> {
         .exchange_code(oauth2::AuthorizationCode::new(code))
         .request(http_client)
         .expect("Failed to exchange code");
-    
+
     let mut token_manager = DROPBOX_TOKEN.lock().unwrap();
     token_manager.set_token(
         token_response.access_token().secret().to_string(),
-        token_response.expires_in().map(|d| d.as_secs()).unwrap_or(14400) // Default to 4 hours if not specified
+        token_response.refresh_token().unwrap().secret().to_string(),
+        token_response
+            .expires_in()
+            .map(|d| d.as_secs())
+            .unwrap_or(14400), // Default to 4 hours if not specified
     );
     println!("DROPBOX_TOKEN: {}", token_manager.token);
     Ok(())
@@ -302,6 +342,7 @@ fn upload_image_to_dropbox(file_path: &Path) -> Result<String, anyhow::Error> {
         .post("https://content.dropboxapi.com/2/files/upload")
         .headers(headers)
         .body(file_bytes)
+        .timeout(Duration::from_secs(60))
         .send()?;
 
     if res.status().is_success() {
@@ -430,6 +471,7 @@ fn send_note_to_notion(note: Note) -> Result<(), anyhow::Error> {
         .header(AUTHORIZATION, format!("Bearer {}", notion_token))
         .header(CONTENT_TYPE, "application/json")
         .json(json_request)
+        .timeout(Duration::from_secs(60))
         .send()?;
 
     if res.status() != 200 {
@@ -525,6 +567,26 @@ fn check_note_exists_in_notion(title: &str) -> Result<bool> {
     Ok(!results.is_empty())
 }
 
+fn snapshot_progress(current_index: usize) -> Result<()> {
+    let mut file = File::create("processing_snapshot.txt")?;
+    writeln!(file, "{}", current_index)?;
+    Ok(())
+}
+
+fn load_snapshot() -> Result<Option<usize>> {
+    match File::open("processing_snapshot.txt") {
+        Ok(file) => {
+            let reader = BufReader::new(file);
+            if let Some(Ok(line)) = reader.lines().next() {
+                Ok(Some(line.parse::<usize>()?))
+            } else {
+                Ok(None)
+            }
+        }
+        Err(_) => Ok(None),
+    }
+}
+
 fn main() -> Result<()> {
     dotenv().ok();
     let args: Vec<String> = env::args().collect();
@@ -545,14 +607,18 @@ fn main() -> Result<()> {
         .unwrap()
         .progress_chars("#>-"));
 
+    let start_index = load_snapshot()?.unwrap_or(0);
+    println!("Starting from file number {}", start_index);
+
     let mut skipped_count = 0;
-    for html_file in html_files {
+    for (index, html_file) in html_files.into_iter().enumerate().skip(start_index) {
         let title = extract_html_title(&html_file)?;
 
         // Check if note already exists in Notion
         if check_note_exists_in_notion(&title)? {
             pb.set_message(format!("Skipping existing note: {}", title));
             skipped_count += 1;
+            snapshot_progress(index + 1)?;
             pb.inc(1);
             continue;
         }
@@ -617,6 +683,7 @@ fn main() -> Result<()> {
         );
 
         // Increment progress for HTML file
+        snapshot_progress(index + 1)?;
         pb.inc(1);
     }
 
