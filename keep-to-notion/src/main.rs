@@ -1,17 +1,61 @@
 use anyhow::{Context, Result};
 use dotenv::dotenv;
+use indicatif::{ProgressBar, ProgressStyle};
+use oauth2::{
+    basic::BasicClient, reqwest::http_client, AuthUrl, ClientId, ClientSecret, CsrfToken,
+    RedirectUrl, Scope, TokenResponse, TokenUrl,
+};
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use scraper::{Html, Selector};
 use serde_json::json;
 use std::env;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{Write};
+use std::io::{BufWriter, BufRead};
 use std::path::{Path, PathBuf};
 use std::{fs, vec};
+use url::Url;
 use walkdir::WalkDir;
 use zip;
-use indicatif::{ProgressBar, ProgressStyle};
+use lazy_static::lazy_static;
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Clone)]
+struct TokenManager {
+    token: String,
+    expires_at: u64,
+}
+
+impl TokenManager {
+    fn new() -> Self {
+        Self {
+            token: String::new(),
+            expires_at: 0,
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        let current_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        self.expires_at > current_time && !self.token.is_empty()
+    }
+
+    fn set_token(&mut self, token: String, expires_in: u64) {
+        self.token = token;
+        self.expires_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() + expires_in;
+    }
+}
+
+lazy_static! {
+    static ref DROPBOX_TOKEN: Mutex<TokenManager> = Mutex::new(TokenManager::new());
+}
 
 fn find_html_files(dir: &Path) -> Vec<PathBuf> {
     WalkDir::new(dir)
@@ -150,13 +194,88 @@ fn _copy_image(image_path: &Path, target_folder: &Path) -> Result<(), anyhow::Er
     Ok(())
 }
 
+fn get_dropbox_token() -> Result<String> {
+    let token_manager = DROPBOX_TOKEN.lock().unwrap();
+    if !token_manager.is_valid() {
+        drop(token_manager);
+        create_dropbox_token()?;
+        Ok(DROPBOX_TOKEN.lock().unwrap().token.clone())
+    } else {
+        Ok(token_manager.token.clone())
+    }
+}
+
+fn create_dropbox_token() -> Result<()> {
+    let client_id = env::var("DROPBOX_KEY")?;
+    let secret = env::var("DROPBOX_SECRET")?;
+
+    // 1. Setup OAuth2 client
+    let client = BasicClient::new(
+        ClientId::new(client_id),
+        Some(ClientSecret::new(secret)),
+        AuthUrl::new("https://www.dropbox.com/oauth2/authorize".to_string()).unwrap(),
+        Some(TokenUrl::new("https://api.dropboxapi.com/oauth2/token".to_string()).unwrap()),
+    )
+    .set_redirect_uri(RedirectUrl::new("http://localhost:8080/callback".to_string()).unwrap());
+
+    // 2. Generate the authorization URL
+    let (auth_url, _csrf_token) = client
+        .authorize_url(CsrfToken::new_random)
+        .add_scope(Scope::new("files.content.write".to_string()))
+        .add_scope(Scope::new("files.content.read".to_string()))
+        .add_scope(Scope::new("sharing.write".to_string()))
+        .url();
+
+    // 3. Open the authorization URL in the default browser
+    println!("Please open this URL in your browser to authorize the application:");
+    println!("{}", auth_url);
+    
+    // 4. Start a local server to receive the callback
+    let listener = std::net::TcpListener::bind("127.0.0.1:8080")?;
+    println!("Waiting for authorization...");
+    
+    // 5. Handle the callback
+    let (stream, _) = listener.accept()?;
+    let mut stream = std::io::BufReader::new(stream);
+    let mut request_line = String::new();
+    stream.read_line(&mut request_line)?;
+    
+    // 6. Extract the authorization code from the request
+    let code = request_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|path| {
+            Url::parse(&format!("http://localhost{}", path))
+                .ok()
+                .and_then(|url| {
+                    url.query_pairs()
+                        .find(|(key, _)| key == "code")
+                        .map(|(_, value)| value.into_owned())
+                })
+        })
+        .ok_or_else(|| anyhow::anyhow!("Failed to get authorization code"))?;
+
+    // 7. Exchange the code for a token
+    let token_response = client
+        .exchange_code(oauth2::AuthorizationCode::new(code))
+        .request(http_client)
+        .expect("Failed to exchange code");
+    
+    let mut token_manager = DROPBOX_TOKEN.lock().unwrap();
+    token_manager.set_token(
+        token_response.access_token().secret().to_string(),
+        token_response.expires_in().map(|d| d.as_secs()).unwrap_or(14400) // Default to 4 hours if not specified
+    );
+    println!("DROPBOX_TOKEN: {}", token_manager.token);
+    Ok(())
+}
+
 fn upload_image_to_dropbox(file_path: &Path) -> Result<String, anyhow::Error> {
-    dotenv().ok();
     let dropbox_path = format!(
         "/images/notion/{}",
         file_path.file_name().unwrap().to_str().unwrap()
     );
-    let access_token = env::var("DROPBOX_ACCESS_TOKEN")?;
+    let access_token = get_dropbox_token()?;
 
     let file_bytes = fs::read(file_path)?;
 
@@ -195,8 +314,7 @@ fn upload_image_to_dropbox(file_path: &Path) -> Result<String, anyhow::Error> {
 }
 
 fn get_or_create_shared_link(path: &str) -> Result<String, anyhow::Error> {
-    dotenv().ok();
-    let token = env::var("DROPBOX_ACCESS_TOKEN")?;
+    let token = get_dropbox_token()?;
     let client = Client::new();
 
     // Try creating a new shared link
@@ -253,7 +371,6 @@ fn get_or_create_shared_link(path: &str) -> Result<String, anyhow::Error> {
 }
 
 fn send_note_to_notion(note: Note) -> Result<(), anyhow::Error> {
-    dotenv().ok();
     let notion_token = env::var("NOTION_TOKEN")?;
     let database_id = env::var("NOTION_DATABASE_ID")?;
     let client = Client::new();
@@ -265,12 +382,15 @@ fn send_note_to_notion(note: Note) -> Result<(), anyhow::Error> {
         .collect::<Vec<_>>();
 
     let chunks = split_text(note.body, 1000);
-    let rich_text_array: Vec<_> = chunks.iter().map(|chunk| {
-        json!({
-            "type": "text",
-            "text": { "content": chunk }
+    let rich_text_array: Vec<_> = chunks
+        .iter()
+        .map(|chunk| {
+            json!({
+                "type": "text",
+                "text": { "content": chunk }
+            })
         })
-    }).collect();
+        .collect();
     let paragraph_block = json!({
         "object": "block",
         "type": "paragraph",
@@ -325,7 +445,7 @@ fn send_note_to_notion(note: Note) -> Result<(), anyhow::Error> {
 fn split_text(text: &str, max_len: usize) -> Vec<String> {
     let mut result = Vec::new();
     let mut start = 0;
-    
+
     // Makeing sure not to cut in the middle of a UTF-8 character:
     let chars: Vec<char> = text.chars().collect();
     let len = chars.len();
@@ -368,7 +488,6 @@ fn _zip_and_cleanup(target_dir: &Path) -> Result<(), anyhow::Error> {
 }
 
 fn check_note_exists_in_notion(title: &str) -> Result<bool> {
-    dotenv().ok();
     let notion_token = env::var("NOTION_TOKEN")?;
     let database_id = env::var("NOTION_DATABASE_ID")?;
     let client = Client::new();
@@ -383,7 +502,10 @@ fn check_note_exists_in_notion(title: &str) -> Result<bool> {
     });
 
     let res = client
-        .post(format!("https://api.notion.com/v1/databases/{}/query", database_id))
+        .post(format!(
+            "https://api.notion.com/v1/databases/{}/query",
+            database_id
+        ))
         .header("Notion-Version", "2022-06-28")
         .header(AUTHORIZATION, format!("Bearer {}", notion_token))
         .header(CONTENT_TYPE, "application/json")
@@ -391,16 +513,20 @@ fn check_note_exists_in_notion(title: &str) -> Result<bool> {
         .send()?;
 
     if res.status() != 200 {
-        return Err(anyhow::anyhow!("Failed to query Notion database: {}", res.text()?));
+        return Err(anyhow::anyhow!(
+            "Failed to query Notion database: {}",
+            res.text()?
+        ));
     }
 
     let response: serde_json::Value = res.json()?;
     let results = response["results"].as_array().unwrap();
-    
+
     Ok(!results.is_empty())
 }
 
 fn main() -> Result<()> {
+    dotenv().ok();
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
         eprintln!("Usage: {} <source_dir>", args[0]);
@@ -422,7 +548,7 @@ fn main() -> Result<()> {
     let mut skipped_count = 0;
     for html_file in html_files {
         let title = extract_html_title(&html_file)?;
-        
+
         // Check if note already exists in Notion
         if check_note_exists_in_notion(&title)? {
             pb.set_message(format!("Skipping existing note: {}", title));
@@ -437,7 +563,10 @@ fn main() -> Result<()> {
         let mut block_size: u64 = 0;
 
         // Update progress message to show current HTML file
-        pb.set_message(format!("Processing HTML: {:?}", html_file.file_name().unwrap()));
+        pb.set_message(format!(
+            "Processing HTML: {:?}",
+            html_file.file_name().unwrap()
+        ));
 
         let img_srcs = extract_img_srcs(&html_file)?;
         for img_src in img_srcs {
@@ -445,7 +574,7 @@ fn main() -> Result<()> {
             if let Some(found_image_path) = find_image_in_dir(source_dir, filename) {
                 // Update progress message to show current image
                 pb.set_message(format!("Processing image: {}", filename));
-                
+
                 // Add the size of image file to block_size
                 let size = fs::metadata(&found_image_path)?.len();
                 block_size += size;
