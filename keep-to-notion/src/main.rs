@@ -319,8 +319,15 @@ fn upload_image_to_dropbox(file_path: &Path) -> Result<String, anyhow::Error> {
 
     let file_bytes = fs::read(file_path)?;
 
-    let client = Client::new();
+    let client = reqwest::blocking::Client::new();
 
+    let dropbox_api_arg = serde_json::json!({
+        "path": dropbox_path,
+        "mode": "overwrite",
+        "autorename": false,
+        "mute": false
+    }).to_string();
+    
     let mut headers = HeaderMap::new();
     headers.insert(
         AUTHORIZATION,
@@ -328,26 +335,26 @@ fn upload_image_to_dropbox(file_path: &Path) -> Result<String, anyhow::Error> {
     );
     headers.insert(
         "Dropbox-API-Arg",
-        HeaderValue::from_str(&format!(
-            r#"{{"path": "{}","mode": "overwrite","autorename": false,"mute": false}}"#,
-            dropbox_path
-        ))?,
+        HeaderValue::from_str(&dropbox_api_arg)?,
     );
     headers.insert(
         CONTENT_TYPE,
         HeaderValue::from_static("application/octet-stream"),
     );
 
+    println!("Uploading {} to Dropbox...", dropbox_path);
+
     let res = client
         .post("https://content.dropboxapi.com/2/files/upload")
         .headers(headers)
         .body(file_bytes)
-        .timeout(Duration::from_secs(60))
+        .timeout(Duration::from_secs(120))
         .send()?;
 
     if res.status().is_success() {
+        println!("Upload success. Getting share link...");
         let url = get_or_create_shared_link(&dropbox_path)?;
-        println!("Uploaded {} to Dropbox URL: {}", dropbox_path, url);
+        println!("Dropbox image URL: {}", url);
         Ok(url)
     } else {
         panic!("Failed to upload image to Dropbox: {:?}", res.text()?);
@@ -608,6 +615,7 @@ fn main() -> Result<()> {
         .progress_chars("#>-"));
 
     let start_index = load_snapshot()?.unwrap_or(0);
+    pb.set_position(start_index as u64 - 1);
     println!("Starting from file number {}", start_index);
 
     let mut skipped_count = 0;
