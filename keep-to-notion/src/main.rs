@@ -372,20 +372,16 @@ fn create_dropbox_token() -> Result<()> {
     Ok(())
 }
 
-async fn upload_image_to_dropbox(file_path: &Path) -> Result<String, anyhow::Error> {
+fn upload_image_to_dropbox(file_path: &Path) -> Result<String, anyhow::Error> {
     let dropbox_path = format!(
         "/images/notion/{}",
         file_path.file_name().unwrap().to_str().unwrap()
     );
-    let access_token = tokio::task::spawn_blocking(|| get_dropbox_token())
-        .await
-        .unwrap()?;
+    let access_token = get_dropbox_token()?;
 
     let file_path = file_path.to_path_buf();
-    let file_bytes = tokio::task::spawn_blocking(move || fs::read(&file_path))
-    .await
-    .unwrap()?;
-    let client = tokio::task::spawn_blocking(|| reqwest::blocking::Client::new()).await?;
+    let file_bytes = fs::read(&file_path)?;
+    let client = reqwest::blocking::Client::new();
 
     let dropbox_api_arg = serde_json::json!({
         "path": dropbox_path,
@@ -408,23 +404,17 @@ async fn upload_image_to_dropbox(file_path: &Path) -> Result<String, anyhow::Err
 
     println!("Uploading {} to Dropbox...", dropbox_path);
 
-    let res = tokio::task::spawn_blocking(move || {
-        client
-            .post("https://content.dropboxapi.com/2/files/upload")
-            .headers(headers)
-            .body(file_bytes)
-            .timeout(Duration::from_secs(120))
-            .send()
-    })
-    .await??;
+    let res = client
+        .post("https://content.dropboxapi.com/2/files/upload")
+        .headers(headers)
+        .body(file_bytes)
+        .timeout(Duration::from_secs(120))
+        .send()?;
 
     if res.status().is_success() {
         println!("Upload success. Getting share link...");
         let dropbox_path_clone = dropbox_path.clone();
-        let url =
-            tokio::task::spawn_blocking(move || get_or_create_shared_link(&dropbox_path_clone))
-                .await
-                .unwrap()?;
+        let url = get_or_create_shared_link(&dropbox_path_clone)?;
         println!("Dropbox image URL: {}", url);
         Ok(url)
     } else {
@@ -697,7 +687,6 @@ async fn process_file(
     };
 
     let title_clone = title.clone();
-
     // Check if note already exists in Notion
     if tokio::task::spawn_blocking(move || check_note_exists_in_notion(&title_clone)).await?? {
         pb.set_message(format!("Skipping existing note: {}", title));
@@ -712,30 +701,84 @@ async fn process_file(
         html_file.file_name().unwrap()
     ));
 
+    let (body, tags, img_srcs) = tokio::try_join!(
+        tokio::task::spawn_blocking({
+            let html_file_clone = html_file.clone();
+            move || extract_html_body(&html_file_clone)
+        }),
+        tokio::task::spawn_blocking({
+            let html_file_clone = html_file.clone();
+            move || extract_html_tags(&html_file_clone)
+        }),
+        tokio::task::spawn_blocking({
+            let html_file_clone = html_file.clone();
+            move || extract_img_srcs(&html_file_clone)
+        })
+    )?;
+
+    
     let mut image_urls = vec![];
     let mut block_size: u64 = 0;
+    {
+        let image_semaphore = Arc::new(Semaphore::new(4)); // Limit to 4 concurrent operations
+        process_images(
+            &pb,
+            source_dir,
+            &mut image_urls,
+            &mut block_size,
+            img_srcs?,
+            image_semaphore
+        )
+        .await?;
+    }
 
-    let (body, tags, img_srcs) = {
-        let html_file_clone = html_file.clone();
-        let body_future = tokio::task::spawn_blocking(move || extract_html_body(&html_file_clone));
+    // Add the size of html file to block_size
+    let html_file_clone = html_file.clone();
+    if let Ok(html_size) = tokio::task::spawn_blocking(move || {
+        fs::metadata(&html_file_clone).map(|m| m.len()).unwrap_or(0)
+    })
+    .await
+    {
+        block_size += html_size;
+    }
 
-        let html_file_clone = html_file.clone();
-        let tags_future = tokio::task::spawn_blocking(move || extract_html_tags(&html_file_clone));
-
-        let html_file_clone = html_file.clone();
-        let img_srcs_future =
-            tokio::task::spawn_blocking(move || extract_img_srcs(&html_file_clone));
-
-        let body = body_future.await??;
-        let tags = tags_future.await??;
-        let img_srcs = img_srcs_future.await??;
-
-        (body, tags, img_srcs)
+    let tags_clone = tags?.clone();
+    let note = Note {
+        title: title.clone(),
+        body: body?.clone(),
+        tags: tags_clone.clone(),
+        image_paths: image_urls.iter().map(|s| s.to_string()).collect(),
     };
 
-    let image_semaphore = Arc::new(Semaphore::new(4)); // Limit to 4 concurrent operations
+    tokio::task::spawn_blocking(move || send_note_to_notion(note)).await??;
 
-    // Process images in parallel with thread limit
+    println!(
+        "Processed {:?} ({} KB) --> tags: {:?} {}",
+        html_file.file_name().unwrap(),
+        block_size / 1024,
+        tags_clone,
+        if image_urls.is_empty() {
+            ""
+        } else {
+            "** include image(s) **"
+        }
+    );
+
+    // After successful processing, mark the file as processed
+    processed_files.mark_as_processed(&html_file)?;
+    pb.inc(1);
+    Ok(())
+}
+
+async fn process_images(
+    pb: &Arc<ProgressBar>,
+    source_dir: Arc<PathBuf>,
+    image_urls: &mut Vec<String>,
+    block_size: &mut u64,
+    img_srcs: Vec<String>,
+    image_semaphore: Arc<Semaphore>,
+) -> Result<(), anyhow::Error> {
+    let mut handles = Vec::new();
     for img_src in img_srcs {
         let filename = match Path::new(&img_src).file_name().and_then(|n| n.to_str()) {
             Some(f) => f.to_string(),
@@ -751,24 +794,27 @@ async fn process_file(
         let image_semaphore = image_semaphore.clone();
         let found_image_path_clone = found_image_path.clone();
 
+        let _permit = image_semaphore.acquire().await.unwrap();
+
         let size = tokio::task::spawn_blocking(move || {
             fs::metadata(&found_image_path_clone)
                 .map(|m| m.len())
                 .unwrap_or(0)
         });
 
-        let handle = tokio::spawn(async move {
-            let _permit = image_semaphore.acquire().await.unwrap();
+        let handle = tokio::task::spawn_blocking(move || {
             pb_clone.set_message(format!("Processing image: {}", filename));
-            upload_image_to_dropbox(&found_image_path).await
+            upload_image_to_dropbox(&found_image_path)
         });
-
+        handles.push((handle, size));
+    }
+    Ok(for (handle, size) in handles {
         match handle.await {
             Ok(result) => {
                 if let Ok(url) = result {
                     image_urls.push(url);
                     if let Ok(size) = size.await {
-                        block_size += size;
+                        *block_size += size;
                     }
                     pb.inc(1);
                 } else if let Err(e) = result {
@@ -777,47 +823,11 @@ async fn process_file(
             }
             Err(e) => {
                 if e.is_panic() {
-                    panic!("Task panicked, shutting down!"); // ✅ You manually propagate panic
+                    panic!("Task panicked, shutting down!");
                 }
             }
         }
-    }
-
-    // Add the size of html file to block_size
-    let html_file_clone = html_file.clone();
-    if let Ok(html_size) = tokio::task::spawn_blocking(move || {
-        fs::metadata(&html_file_clone).map(|m| m.len()).unwrap_or(0)
     })
-    .await
-    {
-        block_size += html_size;
-    }
-
-    let note = Note {
-        title: title.clone(),
-        body: body.clone(),
-        tags: tags.clone(),
-        image_paths: image_urls.iter().map(|s| s.to_string()).collect(),
-    };
-
-    tokio::task::spawn_blocking(move || send_note_to_notion(note)).await??;
-
-    println!(
-        "Processed {:?} ({} KB) --> tags: {:?} {}",
-        html_file.file_name().unwrap(),
-        block_size / 1024,
-        tags,
-        if image_urls.is_empty() {
-            ""
-        } else {
-            "** include image(s) **"
-        }
-    );
-
-    // After successful processing, mark the file as processed
-    processed_files.mark_as_processed(&html_file)?;
-    pb.inc(1);
-    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -854,7 +864,7 @@ fn main() -> Result<()> {
 
     rt.block_on(async {
         let mut handles = Vec::new();
-        
+
         for html_file in html_files {
             let handle = tokio::spawn(process_file(
                 html_file,
