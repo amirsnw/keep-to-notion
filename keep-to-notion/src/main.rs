@@ -777,8 +777,9 @@ async fn process_images(
     block_size: &mut u64,
     img_srcs: Vec<String>,
     image_semaphore: Arc<Semaphore>,
-) -> Result<(), anyhow::Error> {
+) -> Result<()> {
     let mut handles = Vec::new();
+    
     for img_src in img_srcs {
         let filename = match Path::new(&img_src).file_name().and_then(|n| n.to_str()) {
             Some(f) => f.to_string(),
@@ -794,40 +795,36 @@ async fn process_images(
         let image_semaphore = image_semaphore.clone();
         let found_image_path_clone = found_image_path.clone();
 
-        let _permit = image_semaphore.acquire().await.unwrap();
-
         let size = tokio::task::spawn_blocking(move || {
             fs::metadata(&found_image_path_clone)
                 .map(|m| m.len())
                 .unwrap_or(0)
         });
 
-        let handle = tokio::task::spawn_blocking(move || {
+        let handle = tokio::spawn(async move {
+            let _permit = image_semaphore.acquire().await.unwrap();
             pb_clone.set_message(format!("Processing image: {}", filename));
-            upload_image_to_dropbox(&found_image_path)
+            tokio::task::spawn_blocking(move || {upload_image_to_dropbox(&found_image_path)}).await.unwrap()
         });
+        
         handles.push((handle, size));
     }
-    Ok(for (handle, size) in handles {
+
+    for (handle, size) in handles {
         match handle.await {
-            Ok(result) => {
-                if let Ok(url) = result {
-                    image_urls.push(url);
-                    if let Ok(size) = size.await {
-                        *block_size += size;
-                    }
-                    pb.inc(1);
-                } else if let Err(e) = result {
-                    eprintln!("Processing error: {}", e);
+            Ok(Ok(url)) => {
+                image_urls.push(url);
+                if let Ok(size) = size.await {
+                    *block_size += size;
                 }
+                pb.inc(1);
             }
-            Err(e) => {
-                if e.is_panic() {
-                    panic!("Task panicked, shutting down!");
-                }
-            }
+            Ok(Err(e)) => eprintln!("Failed to process image: {}", e),
+            Err(e) => eprintln!("Task error: {}", e),
         }
-    })
+    }
+
+    Ok(())
 }
 
 fn main() -> Result<()> {
